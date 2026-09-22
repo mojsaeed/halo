@@ -121,12 +121,10 @@ def _quant_weight(w: torch.Tensor, fmt: str, k_pad: int, cacheable: bool = True)
         if fmt == "nvfp4"
         else (lambda t: dg_utils.per_block_cast_to_fp8(t, use_ue8m0=True, gran_k=_ALIGN))
     )
-    data0, sf0 = cast(b[0])
-    data = b.new_empty((b.shape[0], *data0.shape), dtype=data0.dtype)
-    sf = sf0.new_empty((b.shape[0], *sf0.shape))
-    data[0], sf[0] = data0, sf0
-    for i in range(1, b.shape[0]):
-        data[i], sf[i] = cast(b[i])
+    flat = b.reshape(-1, b.shape[-1])
+    data_flat, sf_flat = cast(flat)
+    data = data_flat.reshape(b.shape[0], b.shape[1], *data_flat.shape[1:])
+    sf = sf_flat.reshape(b.shape[0], b.shape[1], *sf_flat.shape[1:])
     operand = (data, sf)
     if cacheable:
         _WEIGHT_CACHE.put(w, fingerprint, operand)
