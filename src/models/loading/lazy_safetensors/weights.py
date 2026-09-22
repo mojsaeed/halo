@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 
@@ -21,11 +22,14 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from src.checkpoint.format import has_whole_model_weight_file, resolve_checkpoint_weights
+from src.env import env_int
 from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.checkpoint_coverage import verify_checkpoint_coverage
 from src.models.loading.lazy_safetensors.conversion import Concat, Convert, Rename, convert_disk_keys
 
 logger = logging.getLogger(__name__)
+
+_LAZY_LOAD_WORKERS = env_int("HALO_LAZY_LOAD_WORKERS", 8)
 
 
 def resolve_safetensors_index(model_path: str) -> tuple[dict[str, str], list[str]]:
@@ -215,42 +219,65 @@ class SafetensorsWeightLoader:
         Every materialized tensor is shape-checked against the live target before assignment, since
         this path bypasses ``from_pretrained``'s own size-mismatch check.
         """
+        loadable = [plan for plan in plans if plan.action != WeightAction.IGNORE]
         self._open()
         try:
             loaded = expert_sharded = 0
-            for plan in plans:
-                if plan.action == WeightAction.IGNORE:
-                    continue
-
-                tensor = self._materialize(plan)
-                sharded = plan.action == WeightAction.EXPERT_SHARD
-                verify_loaded_shape(
-                    model,
-                    plan.model_key,
-                    f"checkpoint key(s) {plan.disk_keys}",
-                    tensor,
-                    shard_dim=plan.shard_dim if sharded else None,
-                    shard_len=plan.shard_end - plan.shard_start if sharded else None,
-                )
-                # Every float parameter, overriding the class's _keep_in_fp32_modules[_strict]:
-                # FSDP2 rejects mixed dtypes in one shard group, and the EP from_pretrained fallback
-                # re-casts to match. Parameters only: a float buffer may be fp32 by design (Zaya's
-                # balancing biases).
-                if (
-                    dtype is not None
-                    and tensor.is_floating_point()
-                    and isinstance(_target_tensor(model, plan.model_key), nn.Parameter)
-                ):
-                    tensor = tensor.to(dtype)
-
-                assign_tensor_to_model(model, plan.model_key, tensor)
-                loaded += 1
-                if sharded:
-                    expert_sharded += 1
+            if _LAZY_LOAD_WORKERS > 1 and len(loadable) > 1:
+                with ThreadPoolExecutor(max_workers=_LAZY_LOAD_WORKERS) as executor:
+                    tensors = executor.map(self._materialize_in_worker, loadable)
+                    materialized = zip(loadable, tensors, strict=True)
+                    loaded, expert_sharded = self._assign_loaded(model, materialized, dtype)
+            else:
+                materialized = ((plan, self._materialize(plan)) for plan in loadable)
+                loaded, expert_sharded = self._assign_loaded(model, materialized, dtype)
 
             logger.info(f"Loaded {loaded} parameters ({expert_sharded} expert-sharded) to device={self._device}")
         finally:
             self._close()
+
+    def _assign_loaded(self, model, materialized, dtype):
+        """Validate, cast, and assign already-materialized tensors in plan order."""
+        loaded = expert_sharded = 0
+        for plan, tensor in materialized:
+            sharded = plan.action == WeightAction.EXPERT_SHARD
+            verify_loaded_shape(
+                model,
+                plan.model_key,
+                f"checkpoint key(s) {plan.disk_keys}",
+                tensor,
+                shard_dim=plan.shard_dim if sharded else None,
+                shard_len=plan.shard_end - plan.shard_start if sharded else None,
+            )
+            # Every float parameter, overriding the class's _keep_in_fp32_modules[_strict]:
+            # FSDP2 rejects mixed dtypes in one shard group, and the EP from_pretrained fallback
+            # re-casts to match. Parameters only: a float buffer may be fp32 by design (Zaya's
+            # balancing biases).
+            if (
+                dtype is not None
+                and tensor.is_floating_point()
+                and isinstance(_target_tensor(model, plan.model_key), nn.Parameter)
+            ):
+                tensor = tensor.to(dtype)
+
+            assign_tensor_to_model(model, plan.model_key, tensor)
+            loaded += 1
+            if sharded:
+                expert_sharded += 1
+        return loaded, expert_sharded
+
+    def _materialize_in_worker(self, plan: WeightPlan) -> torch.Tensor:
+        """Materialize one plan with handles private to this worker thread.
+
+        ``safe_open`` handles are not shared across threads; a worker reuses one handle per shard for
+        all keys in its plan, including fan-in siblings, then releases them before returning.
+        """
+        handles = {}
+        try:
+            tensor = self._materialize(plan, handles)
+        finally:
+            handles.clear()
+        return tensor
 
     def _open(self):
         for sf in self._shard_files:
@@ -267,17 +294,19 @@ class SafetensorsWeightLoader:
             )
         return handle
 
-    def _materialize(self, plan: WeightPlan) -> torch.Tensor:
-        tensor = self._read(plan.disk_key, plan)
+    def _materialize(self, plan: WeightPlan, handles=None) -> torch.Tensor:
+        tensor = self._read(plan.disk_key, plan, handles)
         # Ops act on non-shard dims (asserted at planning), so the ranged reads stay valid.
         for op in plan.ops:
             if isinstance(op, Concat):
-                tensor = torch.cat([tensor, *(self._read(sibling, plan) for sibling in op.siblings)], dim=op.dim)
+                tensor = torch.cat(
+                    [tensor, *(self._read(sibling, plan, handles) for sibling in op.siblings)], dim=op.dim
+                )
             else:
                 tensor = op(tensor)
         return tensor
 
-    def _read(self, disk_key: str, plan: WeightPlan) -> torch.Tensor:
+    def _read(self, disk_key: str, plan: WeightPlan, handles=None) -> torch.Tensor:
         """``disk_key`` read the way ``plan`` reads its own key: whole, or this rank's expert slice."""
         shard_file = self._weight_map.get(disk_key)
         if shard_file is None:
@@ -285,7 +314,15 @@ class SafetensorsWeightLoader:
                 f"Lazy load: planned checkpoint key {disk_key!r} (for model tensor {plan.model_key!r}) "
                 f"is absent from the safetensors index at {self._model_path}."
             )
-        s = self._handle(shard_file).get_slice(disk_key)
+        if handles is None:
+            handle = self._handle(shard_file)
+        else:
+            handle = handles.get(shard_file)
+            if handle is None:
+                handle = handles[shard_file] = safe_open(
+                    os.path.join(self._model_path, shard_file), framework="pt", device=self._device
+                )
+        s = handle.get_slice(disk_key)
         if plan.action != WeightAction.EXPERT_SHARD:
             return s[...]
 
