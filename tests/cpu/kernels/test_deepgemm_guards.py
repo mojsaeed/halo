@@ -79,6 +79,26 @@ def test_full_coverage_passes_the_guard(monkeypatch):
         _forward(monkeypatch, [10, 20, 30, T])
 
 
+def test_quant_weight_batches_all_expert_rows(monkeypatch):
+    """One cast over [E*N, K] is equivalent to casting each expert's [N, K] slice."""
+    calls = []
+
+    def cast(tensor):
+        calls.append(tuple(tensor.shape))
+        return tensor.clone(), torch.ones(tensor.shape[0], 1)
+
+    utils = types.SimpleNamespace(per_block_cast_to_fp8=cast)
+    monkeypatch.setattr(deepgemm, "_deep_gemm", lambda: (None, utils))
+    weight = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+
+    data, scales = deepgemm._quant_weight(weight, "mxfp8", 4, cacheable=False)
+
+    assert calls == [(6, 4)]
+    assert data.shape == (2, 3, 4)
+    assert scales.shape == (2, 3, 1)
+    assert torch.equal(data, weight)
+
+
 def test_fallback_warning_fires_once_per_weight_shape(caplog):
     """The warning promises once per shape, and the routed token count varies every forward — so a
     key carrying it would both re-warn each step and grow the seen-set without bound."""

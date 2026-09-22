@@ -13,6 +13,8 @@ each declaring family's real mapping is pinned bitwise against ``from_pretrained
 
 import json
 import sys
+import threading
+import time
 from functools import cache
 from types import SimpleNamespace
 
@@ -372,6 +374,41 @@ def test_materializer_reads_every_fan_in_source_through_the_expert_slice(tmp_pat
             loader._materialize(plan)
     finally:
         loader._close()
+
+
+def test_lazy_loader_reads_plans_concurrently_and_assigns_in_order(tmp_path, monkeypatch):
+    """Reads may overlap, but model mutation follows the original plan order."""
+    first = torch.full((2, 2), 1.0)
+    second = torch.full((2, 2), 2.0)
+    save_file({"first": first}, str(tmp_path / "first.safetensors"))
+    save_file({"second": second}, str(tmp_path / "second.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"first": "first.safetensors", "second": "second.safetensors"}})
+    )
+
+    model = torch.nn.Module()
+    model.first = torch.nn.Parameter(torch.empty_like(first))
+    model.second = torch.nn.Parameter(torch.empty_like(second))
+    plans = [
+        WeightPlan(WeightAction.REPLICATE, "first.safetensors", "first", "first"),
+        WeightPlan(WeightAction.REPLICATE, "second.safetensors", "second", "second"),
+    ]
+    loader = SafetensorsWeightLoader(str(tmp_path), ["first.safetensors", "second.safetensors"], device="cpu")
+    monkeypatch.setattr("src.models.loading.lazy_safetensors.weights._LAZY_LOAD_WORKERS", 2)
+    thread_ids = set()
+    original_read = loader._read
+
+    def tracked_read(disk_key, plan, handles=None):
+        thread_ids.add(threading.get_ident())
+        time.sleep(0.02)
+        return original_read(disk_key, plan, handles)
+
+    monkeypatch.setattr(loader, "_read", tracked_read)
+    loader.load_into_model(model, plans)
+
+    assert len(thread_ids) == 2
+    assert torch.equal(model.first, first)
+    assert torch.equal(model.second, second)
 
 
 def _shell(model_type: str):
