@@ -121,12 +121,13 @@ def _quant_weight(w: torch.Tensor, fmt: str, k_pad: int, cacheable: bool = True)
         if fmt == "nvfp4"
         else (lambda t: dg_utils.per_block_cast_to_fp8(t, use_ue8m0=True, gran_k=_ALIGN))
     )
-    data0, sf0 = cast(b[0])
-    data = b.new_empty((b.shape[0], *data0.shape), dtype=data0.dtype)
-    sf = sf0.new_empty((b.shape[0], *sf0.shape))
-    data[0], sf[0] = data0, sf0
-    for i in range(1, b.shape[0]):
-        data[i], sf[i] = cast(b[i])
+    # Per-row-independent scaling (the same guarantee `_deepgemm_forward`'s multi-expert-stacked
+    # `per_token_cast_to_fp8(xp, ...)` activation cast already relies on), so flattening the expert
+    # dim into the row dim and casting once is exact vs. one kernel launch per expert.
+    E, N, K = b.shape
+    data_flat, sf_flat = cast(b.reshape(E * N, K))
+    data = data_flat.reshape(E, N, *data_flat.shape[1:])
+    sf = sf_flat.reshape(E, N, *sf_flat.shape[1:])
     operand = (data, sf)
     if cacheable:
         _WEIGHT_CACHE.put(w, fingerprint, operand)
