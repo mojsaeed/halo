@@ -121,13 +121,16 @@ def _quant_weight(w: torch.Tensor, fmt: str, k_pad: int, cacheable: bool = True)
         if fmt == "nvfp4"
         else (lambda t: dg_utils.per_block_cast_to_fp8(t, use_ue8m0=True, gran_k=_ALIGN))
     )
-    # Per-row-independent scaling (the same guarantee `_deepgemm_forward`'s multi-expert-stacked
-    # `per_token_cast_to_fp8(xp, ...)` activation cast already relies on), so flattening the expert
-    # dim into the row dim and casting once is exact vs. one kernel launch per expert.
+    # fp4 scales row-wise, so stacked experts quantize independently. The fp8 weight cast scales
+    # _ALIGN x _ALIGN blocks: stacked experts stay independent only when N is block-aligned.
     E, N, K = b.shape
-    data_flat, sf_flat = cast(b.reshape(E * N, K))
-    data = data_flat.reshape(E, N, *data_flat.shape[1:])
-    sf = sf_flat.reshape(E, N, *sf_flat.shape[1:])
+    if fmt == "nvfp4" or N % _ALIGN == 0:
+        data_flat, sf_flat = cast(b.reshape(E * N, K))
+        data = data_flat.reshape(E, -1, *data_flat.shape[1:])
+        sf = sf_flat.reshape(E, -1, *sf_flat.shape[1:])
+    else:
+        parts = [cast(b[i]) for i in range(E)]
+        data, sf = torch.stack([d for d, _ in parts]), torch.stack([s for _, s in parts])
     operand = (data, sf)
     if cacheable:
         _WEIGHT_CACHE.put(w, fingerprint, operand)
